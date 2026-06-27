@@ -619,8 +619,8 @@ macd_row=(3 if show_rsi else 2) if show_macd else None
 if show_rsi and rsi_row:
     fig.add_trace(go.Scatter(x=rsi.index,y=rsi.values,name="RSI(14)",
         line=dict(color="#f59e0b",width=1.2)),row=rsi_row,col=1)
-    for lvl,clr in [(70,"rgba(248,113,113,.4)"),(30,"rgba(52,211,153,.4)")]:
-        fig.add_hline(y=lvl,line=dict(color=clr,width=1,dash="dash"),row=rsi_row,col=1)
+    for rsi_lvl,clr in [(70,"rgba(248,113,113,.4)"),(30,"rgba(52,211,153,.4)")]:
+        fig.add_hline(y=rsi_lvl,line=dict(color=clr,width=1,dash="dash"),row=rsi_row,col=1)
 
 if show_macd and macd_row:
     fig.add_trace(go.Bar(x=hist_m.index,y=hist_m.values,name="MACD Hist",
