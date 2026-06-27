@@ -139,20 +139,13 @@ SUFFIX_EXCHANGE_MAP = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def resolve_symbol(raw_input, exchange_suffix):
     """
-    Smart resolver: tries name map → Yahoo search → symbol+suffix fallback.
-    Returns (ticker_symbol, detected_exchange_label)
+    Smart resolver: tries Yahoo Finance search API first → falls back to local
+    name map → falls back to symbol+suffix. Returns (ticker_symbol, detected_exchange_label)
     """
     raw = raw_input.strip()
     low = raw.lower()
 
-    # 1. Check name map
-    if low in NAME_MAP:
-        sym = NAME_MAP[low]
-        for sfx, exch in SUFFIX_EXCHANGE_MAP.items():
-            if sym.endswith(sfx): return sym, exch
-        return sym, "🇺🇸 NYSE / NASDAQ"
-
-    # 2. Try Yahoo Finance search API (works on Streamlit Cloud)
+    # 1. Try Yahoo Finance search API first (works on Streamlit Cloud)
     try:
         url = "https://query2.finance.yahoo.com/v1/finance/search"
         r = requests.get(url, params={"q": raw, "quotesCount": 5, "newsCount": 0},
@@ -167,6 +160,13 @@ def resolve_symbol(raw_input, exchange_suffix):
                         if sym.endswith(sfx): return sym, exch
                     return sym, "🇺🇸 NYSE / NASDAQ"
     except: pass
+
+    # 2. Fall back to local name map
+    if low in NAME_MAP:
+        sym = NAME_MAP[low]
+        for sfx, exch in SUFFIX_EXCHANGE_MAP.items():
+            if sym.endswith(sfx): return sym, exch
+        return sym, "🇺🇸 NYSE / NASDAQ"
 
     # 3. Treat as direct symbol + chosen exchange suffix
     sym = raw.upper() + exchange_suffix
@@ -288,6 +288,40 @@ def arima_price_forecast(close,p,q,fc_days):
             pd.Series(ci_lo[:n],index=fut[:n]),
             pd.Series(ci_hi[:n],index=fut[:n]),model)
 
+def confidence_label(model,ci_lo,ci_hi,cur):
+    """Translate AIC/BIC fit quality + forecast band width into plain English."""
+    try:
+        band_pct=float((ci_hi.iloc[-1]-ci_lo.iloc[-1])/cur*100)
+        aic_bic_gap=abs(float(model.aic)-float(model.bic))
+        if band_pct<25 and aic_bic_gap<10:
+            return "High","#34d399","Tight forecast band and a well-fit model (AIC/BIC close together)."
+        elif band_pct<50:
+            return "Medium","#f59e0b","Moderate forecast uncertainty — treat the target as a range, not a point."
+        else:
+            return "Low","#f87171","Wide forecast band — long horizon or volatile stock reduces precision."
+    except Exception:
+        return "Medium","#f59e0b","Could not fully assess model fit — treat the forecast with caution."
+
+def backtest_arima(close,p,q,test_days=60):
+    """Train on all data except the last `test_days`, forecast that window, compare to actual."""
+    if len(close)<test_days*2:
+        return None
+    train=close.iloc[:-test_days]; actual=close.iloc[-test_days:]
+    try:
+        log_ret=np.log(train/train.shift(1)).dropna()
+        bt_model=ARIMA(log_ret,order=(p,0,q)).fit()
+        fc_res=bt_model.get_forecast(steps=test_days)
+        fc_lr=fc_res.predicted_mean.values
+        last=float(train.iloc[-1])
+        pred=last*np.exp(np.cumsum(fc_lr))
+        n=min(len(pred),len(actual))
+        pred_s=pd.Series(pred[:n],index=actual.index[:n])
+        actual_s=actual.iloc[:n]
+        mape=float(np.mean(np.abs((actual_s.values-pred_s.values)/actual_s.values))*100)
+        return pred_s,actual_s,mape
+    except Exception:
+        return None
+
 def get_sentiment(news):
     if not news: return 0.0,[]
     sia=SentimentIntensityAnalyzer(); scores,hl=[],[]
@@ -297,6 +331,70 @@ def get_sentiment(news):
             sc=sia.polarity_scores(t)["compound"]; scores.append(sc); hl.append((t,sc))
     return (float(np.mean(scores)) if scores else 0.0),hl
 
+def trend_strength(close):
+    """One-line trend label from price vs SMA20/50/200 alignment."""
+    if len(close) < 200:
+        return "Insufficient Data", "#94a3b8"
+    px   = float(close.iloc[-1])
+    s20  = float(close.rolling(20).mean().iloc[-1])
+    s50  = float(close.rolling(50).mean().iloc[-1])
+    s200 = float(close.rolling(200).mean().iloc[-1])
+    if px > s20 > s50 > s200:  return "Strong Uptrend", "#10b981"
+    if px < s20 < s50 < s200:  return "Strong Downtrend", "#dc2626"
+    if px > s50 and px > s200: return "Uptrend", "#34d399"
+    if px < s50 and px < s200: return "Downtrend", "#f87171"
+    return "Sideways", "#f59e0b"
+
+def compute_signal(cur, fc_end, rsi_now, trend_label):
+    """Combine forecast direction, trend alignment and RSI momentum into BUY/SELL/WAIT."""
+    score = 0
+    chg_pct = (fc_end - cur) / cur * 100
+    if chg_pct > 3:    score += 1
+    elif chg_pct < -3: score -= 1
+    if trend_label in ("Strong Uptrend", "Uptrend"):     score += 1
+    elif trend_label in ("Strong Downtrend", "Downtrend"): score -= 1
+    if rsi_now < 35:  score += 1
+    elif rsi_now > 70: score -= 1
+    if score >= 2:
+        return ("BUY", "#10b981",
+                "Forecast trend, price trend and momentum are aligned to the upside.")
+    if score <= -2:
+        return ("SELL", "#ef4444",
+                "Forecast trend, price trend and momentum are aligned to the downside.")
+    return ("WAIT", "#f59e0b",
+            "Signals are mixed — wait for clearer confirmation before entering a position.")
+
+def position_sizing(capital, entry, sl, t1, t2):
+    """₹ capital → max shares, capital at risk, and potential reward at T1/T2."""
+    if capital is None or capital <= 0 or entry is None or entry <= 0:
+        return None
+    risk_per_share = entry - sl
+    max_shares = int(capital // entry)
+    return {
+        "max_shares":      max_shares,
+        "total_cost":      max_shares * entry,
+        "capital_at_risk": max_shares * risk_per_share if risk_per_share > 0 else 0.0,
+        "reward_t1":       max_shares * (t1 - entry),
+        "reward_t2":       max_shares * (t2 - entry),
+    }
+
+def rr_bar_chart(lvl, accent, bg, grid):
+    """Horizontal Entry/SL/Target1-3 risk:reward bar chart."""
+    labels = ["Target 3", "Target 2", "Target 1", "Entry", "Stop Loss"]
+    values = [lvl["t3"], lvl["t2"], lvl["t1"], lvl["entry"], lvl["sl"]]
+    pcts   = [lvl["t3_pct"], lvl["t2_pct"], lvl["t1_pct"], 0.0, lvl["sl_pct"]]
+    colors = ["#a855f7", "#c084fc", "#34d399", accent, "#f87171"]
+    text   = [f"{fmt_price(v)}  ({p:+.2f}%)" for v, p in zip(values, pcts)]
+    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h",
+        marker_color=colors, text=text, textposition="outside",
+        textfont=dict(color="#e2e8f0", size=11)))
+    fig.update_layout(paper_bgcolor=bg, plot_bgcolor=bg, height=260,
+        margin=dict(l=0, r=90, t=10, b=10), showlegend=False,
+        xaxis=dict(showgrid=True, gridcolor=grid, tickprefix="₹", tickformat=",.0f", color="#6b84a0"),
+        yaxis=dict(color="#e2e8f0", tickfont=dict(size=12)),
+        font=dict(family="Inter", color="#6b84a0", size=11))
+    return fig
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""<div style='padding:.5rem 0 .15rem 0;'>
@@ -304,61 +402,60 @@ with st.sidebar:
       <span style='color:#2d4060;font-size:.65rem;'>IndiaForecast Suite · App 1 of 3</span>
     </div><hr style='border-color:{BORDER};margin:.4rem 0 .8rem 0;'>""",unsafe_allow_html=True)
 
-    mode=st.radio("Mode",["🔍 Search by Name or Symbol","📋 NSE Live List","📊 Major Indexes"],
-                  label_visibility="collapsed")
+    st.markdown("<div class='sec-label'>🔍 One-Shot Search</div>",unsafe_allow_html=True)
+    quick_search=st.text_input("Search stock or symbol",
+        placeholder="e.g. Reliance, INFY, Apple, AAPL — press Enter",
+        label_visibility="collapsed",key="quick_search").strip()
+    st.caption("Type a name or symbol and hit Enter — everything below loads automatically. No mode to pick.")
+
     ticker_sym=""; short_name=""; long_name=""
 
-    if mode=="📊 Major Indexes":
-        idx=st.selectbox("Index / Asset",list(INDEXES.keys()))
-        ticker_sym=INDEXES[idx]; short_name=idx; long_name=idx
-
-    elif mode=="📋 NSE Live List":
-        with st.spinner("Loading NSE list…"):
-            nse=fetch_nse_list()
-        if nse:
-            q2=st.text_input("🔍 Filter",placeholder="INFY, Reliance…")
-            opts={k:v for k,v in nse.items() if q2.upper() in k.upper()} if q2.strip() else nse
-            opts=opts or nse
-            lbl=st.selectbox("Stock",list(opts.keys()),label_visibility="collapsed")
-            ticker_sym=opts[lbl]
-            p2=lbl.split(" — "); short_name=p2[0].strip()
-            long_name=p2[1].strip() if len(p2)>1 else p2[0]
-        else:
-            st.warning("Could not load NSE list. Use Search mode.")
-            ticker_sym="RELIANCE.NS"; short_name="RELIANCE"; long_name="Reliance Industries"
-
-    else:  # Search mode
-        raw_input=st.text_input("Stock name or symbol",
-            placeholder="e.g. Reliance / INFY / Apple / AAPL").strip()
-
-        exch_auto=""
-        if raw_input:
-            # Show suggestions from name map
-            suggs=search_suggestions(raw_input)
-            if suggs:
-                st.markdown("<div style='color:#38bdf8;font-size:.65rem;margin-bottom:.3rem;'>Suggestions:</div>",
-                            unsafe_allow_html=True)
-                for name_s,sym_s in suggs[:4]:
-                    if st.button(f"{name_s}  ({sym_s})",key=sym_s,use_container_width=True):
-                        raw_input=sym_s
+    if quick_search:
+        suggs=search_suggestions(quick_search)
+        if suggs:
+            st.markdown(f"<div style='color:{ACCENT};font-size:.65rem;margin:.3rem 0;'>Suggestions:</div>",
+                        unsafe_allow_html=True)
+            for name_s,sym_s in suggs[:4]:
+                if st.button(f"{name_s}  ({sym_s})",key=f"sugg_{sym_s}",use_container_width=True):
+                    quick_search=sym_s
 
         exch_default_idx=0
-        if ticker_sym:
-            for i,(k,v) in enumerate(EXCHANGES.items()):
-                if ticker_sym.endswith(v) and v: exch_default_idx=i; break
-
-        exch=st.selectbox("Exchange (auto-detected · override if needed)",
+        exch=st.selectbox("Exchange (override if symbol is ambiguous)",
                           list(EXCHANGES.keys()),index=exch_default_idx)
         exch_suffix=EXCHANGES[exch]
 
-        if raw_input:
-            ticker_sym,_=resolve_symbol(raw_input,exch_suffix)
-            # Override suffix with user-chosen exchange if they changed it
-            for sfx in SUFFIX_EXCHANGE_MAP:
-                if ticker_sym.endswith(sfx):
-                    ticker_sym=ticker_sym.replace(sfx,exch_suffix) if exch_suffix else ticker_sym.split(".")[0]
-                    break
-            parts=ticker_sym.split("."); short_name=parts[0]; long_name=raw_input.title()
+        ticker_sym,_=resolve_symbol(quick_search,exch_suffix)
+        # Override suffix with user-chosen exchange if they changed it
+        for sfx in SUFFIX_EXCHANGE_MAP:
+            if ticker_sym.endswith(sfx):
+                ticker_sym=ticker_sym.replace(sfx,exch_suffix) if exch_suffix else ticker_sym.split(".")[0]
+                break
+        parts=ticker_sym.split("."); short_name=parts[0]; long_name=quick_search.title()
+
+    st.markdown("<hr style='border-color:#1a2640;margin:.6rem 0;'>",unsafe_allow_html=True)
+    with st.expander("📋 Or browse NSE List / Indexes",expanded=not bool(quick_search)):
+        browse_mode=st.radio("Browse",["📋 NSE Live List","📊 Major Indexes"],
+                             label_visibility="collapsed",key="browse_mode")
+        if browse_mode=="📊 Major Indexes":
+            idx=st.selectbox("Index / Asset",list(INDEXES.keys()),key="idx_sel")
+            if not quick_search:
+                ticker_sym=INDEXES[idx]; short_name=idx; long_name=idx
+        else:
+            with st.spinner("Loading NSE list…"):
+                nse=fetch_nse_list()
+            if nse:
+                q2=st.text_input("🔍 Filter",placeholder="INFY, Reliance…",key="nse_filter")
+                opts={k:v for k,v in nse.items() if q2.upper() in k.upper()} if q2.strip() else nse
+                opts=opts or nse
+                lbl=st.selectbox("Stock",list(opts.keys()),label_visibility="collapsed",key="nse_sel")
+                if not quick_search:
+                    ticker_sym=opts[lbl]
+                    p2=lbl.split(" — "); short_name=p2[0].strip()
+                    long_name=p2[1].strip() if len(p2)>1 else p2[0]
+            else:
+                st.warning("Could not load NSE list. Use the search box above instead.")
+                if not quick_search:
+                    ticker_sym="RELIANCE.NS"; short_name="RELIANCE"; long_name="Reliance Industries"
 
     st.markdown("<hr style='border-color:#1a2640;margin:.5rem 0;'>",unsafe_allow_html=True)
     tl_lbl=st.select_slider("Forecast Horizon",list(TIMELINES.keys()),value="6 Months")
@@ -380,6 +477,10 @@ with st.sidebar:
     show_ret   =st.toggle("Returns Distribution",value=False)
     show_sent  =st.toggle("News Sentiment",      value=True)
     show_trade =st.toggle("Trade Levels (Entry/SL/Target)", value=True)
+
+    st.markdown(f"<div class='sec-label' style='margin-top:.7rem;'>Position Sizing</div>",
+                unsafe_allow_html=True)
+    capital=st.number_input("Total Capital (₹)",min_value=0,value=100000,step=10000,format="%d")
 
 if not ticker_sym:
     st.info("Type a stock name or symbol in the sidebar to begin."); st.stop()
@@ -430,6 +531,42 @@ sent_score,headlines=0.0,[]
 if show_sent:
     with st.spinner("Fetching news…"):
         sent_score,headlines=get_sentiment(load_news(ticker_sym))
+
+# ── Signal Card · R:R Bar · Position Sizing ──────────────────────────────────
+trend_lbl,trend_color=trend_strength(close)
+rsi_clean=rsi.dropna()
+rsi_now=float(rsi_clean.iloc[-1]) if len(rsi_clean) else 50.0
+lvl=trading_levels(close,fc_s)
+sig_label,sig_color,sig_reason=compute_signal(cur,float(fc_s.iloc[-1]),rsi_now,trend_lbl)
+
+st.markdown(f"""<div style='background:{CARD};border:2px solid {sig_color};border-radius:14px;
+  padding:1.2rem 1.6rem;margin-bottom:1rem;display:flex;justify-content:space-between;
+  align-items:center;flex-wrap:wrap;gap:1rem;'>
+  <div>
+    <div style='color:{sig_color};font-size:2.1rem;font-weight:800;letter-spacing:.06em;'>{sig_label}</div>
+    <div style='color:#94a3b8;font-size:.78rem;margin-top:.3rem;max-width:480px;line-height:1.5;'>{sig_reason}</div>
+  </div>
+  <div style='text-align:right;'>
+    <div style='color:#4a6080;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;'>Trend Strength</div>
+    <div style='color:{trend_color};font-size:1.15rem;font-weight:700;'>{trend_lbl}</div>
+    <div style='color:#4a6080;font-size:.7rem;margin-top:.25rem;'>RSI {rsi_now:.0f} · {tl_lbl} target {fmt_price(float(fc_s.iloc[-1]))}</div>
+  </div>
+</div>""",unsafe_allow_html=True)
+
+st.markdown("<div class='sec-label'>Risk : Reward — Entry · Stop Loss · Targets</div>",unsafe_allow_html=True)
+st.plotly_chart(rr_bar_chart(lvl,ACCENT,BG,GRID),use_container_width=True)
+
+ps=position_sizing(capital,lvl["entry"],lvl["sl"],lvl["t1"],lvl["t2"])
+if ps:
+    pc1,pc2,pc3,pc4=st.columns(4)
+    pc1.metric("Max Shares",f"{ps['max_shares']:,}",f"Cost {fmt_price(ps['total_cost'])}")
+    pc2.metric("Capital at Risk",fmt_price(ps['capital_at_risk']),
+               f"{(ps['capital_at_risk']/capital*100):.1f}% of capital" if capital else None)
+    pc3.metric("Potential Reward · T1",fmt_price(ps['reward_t1']))
+    pc4.metric("Potential Reward · T2",fmt_price(ps['reward_t2']))
+else:
+    st.caption("Enter your total capital in the sidebar to see position sizing.")
+st.markdown("<br>",unsafe_allow_html=True)
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
 show_tech_sub=show_rsi or show_macd
@@ -540,7 +677,6 @@ st.markdown("<br>",unsafe_allow_html=True)
 # ── Trade Levels ──────────────────────────────────────────────────────────────
 if show_trade:
     st.markdown("<div class='sec-label'>📍 Trade Levels — Entry · Stop Loss · Targets</div>",unsafe_allow_html=True)
-    lvl=trading_levels(close,fc_s)
     tc1,tc2,tc3,tc4=st.columns(4)
     tc1.markdown(f"""<div class='trade-card trade-entry'>
       <div style='color:#38bdf8;font-size:.65rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;'>Entry</div>
@@ -575,6 +711,59 @@ if show_trade:
       <span style='color:#3d5070;font-size:.72rem;'>⚠ Trade levels are indicative only. Do your own research. Not financial advice.</span>
     </div>""",unsafe_allow_html=True)
     st.markdown("<br>",unsafe_allow_html=True)
+
+# ── ARIMA Diagnostics — Confidence · Scenarios · Backtest ───────────────────
+st.markdown("<div class='sec-label'>🎯 ARIMA Diagnostics</div>",unsafe_allow_html=True)
+conf_lbl,conf_color,conf_note=confidence_label(model,ci_lo,ci_hi,cur)
+bull_px=float(ci_hi.iloc[-1]); base_px=float(fc_s.iloc[-1]); bear_px=float(ci_lo.iloc[-1])
+
+dcol1,dcol2,dcol3,dcol4=st.columns(4)
+dcol1.markdown(f"""<div class='fund-card' style='text-align:center;'>
+  <div style='color:#4a6080;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;'>Forecast Confidence</div>
+  <div style='color:{conf_color};font-size:1.4rem;font-weight:800;margin:.3rem 0;'>{conf_lbl}</div>
+  <div style='color:#6b84a0;font-size:.68rem;line-height:1.4;'>{conf_note}</div>
+</div>""",unsafe_allow_html=True)
+dcol2.markdown(f"""<div class='fund-card' style='text-align:center;border-color:rgba(52,211,153,.3);'>
+  <div style='color:#34d399;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;'>Bull Scenario</div>
+  <div style='color:#f0f6ff;font-size:1.25rem;font-weight:700;font-family:JetBrains Mono,monospace;margin:.3rem 0;'>{fmt_price(bull_px)}</div>
+  <div style='color:#34d399;font-size:.72rem;'>Upper 95% CI · {((bull_px-cur)/cur*100):+.1f}%</div>
+</div>""",unsafe_allow_html=True)
+dcol3.markdown(f"""<div class='fund-card' style='text-align:center;border-color:rgba(56,189,248,.3);'>
+  <div style='color:{ACCENT};font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;'>Base Scenario</div>
+  <div style='color:#f0f6ff;font-size:1.25rem;font-weight:700;font-family:JetBrains Mono,monospace;margin:.3rem 0;'>{fmt_price(base_px)}</div>
+  <div style='color:{ACCENT};font-size:.72rem;'>Point Forecast · {((base_px-cur)/cur*100):+.1f}%</div>
+</div>""",unsafe_allow_html=True)
+dcol4.markdown(f"""<div class='fund-card' style='text-align:center;border-color:rgba(248,113,113,.3);'>
+  <div style='color:#f87171;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;'>Bear Scenario</div>
+  <div style='color:#f0f6ff;font-size:1.25rem;font-weight:700;font-family:JetBrains Mono,monospace;margin:.3rem 0;'>{fmt_price(bear_px)}</div>
+  <div style='color:#f87171;font-size:.72rem;'>Lower 95% CI · {((bear_px-cur)/cur*100):+.1f}%</div>
+</div>""",unsafe_allow_html=True)
+
+st.markdown("<br>",unsafe_allow_html=True)
+with st.expander("🧪 60-Day Backtest — Predicted vs Actual",expanded=False):
+    bt=backtest_arima(close,p_val,q_val,60)
+    if bt:
+        pred_s,actual_s,mape=bt
+        fbt=go.Figure()
+        fbt.add_trace(go.Scatter(x=actual_s.index,y=actual_s.values,name="Actual",
+            line=dict(color="#e2e8f0",width=1.6)))
+        fbt.add_trace(go.Scatter(x=pred_s.index,y=pred_s.values,name="Predicted",
+            line=dict(color=ACCENT,width=1.6,dash="dot")))
+        fbt.update_layout(paper_bgcolor=BG,plot_bgcolor=BG,height=260,margin=dict(l=0,r=0,t=10,b=0),
+            legend=dict(bgcolor=CARD,bordercolor=BORDER,borderwidth=1,font=dict(size=10)),
+            xaxis=dict(showgrid=True,gridcolor=GRID,tickformat="%b %Y",color="#6b84a0"),
+            yaxis=dict(showgrid=True,gridcolor=GRID,tickprefix="₹",color="#6b84a0"),
+            font=dict(family="Inter",color="#6b84a0",size=11))
+        st.plotly_chart(fbt,use_container_width=True)
+        bcol1,bcol2=st.columns(2)
+        bcol1.metric("MAPE (60-day)",f"{mape:.2f}%")
+        acc_lbl="Strong" if mape<5 else "Moderate" if mape<10 else "Weak"
+        bcol2.metric("Backtest Read",acc_lbl)
+        st.caption("Model trained on all data except the last 60 days, then forecast forward and "
+                   "compared against what actually happened.")
+    else:
+        st.caption("Not enough price history for a 60-day backtest on this symbol.")
+st.markdown("<br>",unsafe_allow_html=True)
 
 # ── Monthly forecast + Fundamentals ──────────────────────────────────────────
 left,right=st.columns([1.3,1])
